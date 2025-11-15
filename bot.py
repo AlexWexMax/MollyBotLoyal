@@ -6,7 +6,7 @@ from io import BytesIO
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, Text
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
 import qrcode
 from dotenv import load_dotenv
 
@@ -19,7 +19,7 @@ BOT_USERNAME = os.getenv("BOT_USERNAME")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-# ---------------- База данных ----------------
+# ------------------ База данных ------------------
 conn = sqlite3.connect("database.db", check_same_thread=False)
 cursor = conn.cursor()
 
@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS history (
 """)
 conn.commit()
 
-# ---------------- Вспомогательные функции ----------------
+# ------------------ Вспомогательные функции ------------------
 def create_or_update_user(user_id:int, first_name:str=None, username:str=None):
     cursor.execute("""
     INSERT INTO users (user_id, first_name, username)
@@ -84,14 +84,14 @@ def stamp_bar(stamps:int):
     return "".join("🟤" if i<stamps else "⚪" for i in range(10))
 
 def generate_qr(user_id:int):
-    link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
+    link = f"https://t.me/{BOT_USERNAME}?start=admin_{user_id}"
     img = qrcode.make(link)
     bio = BytesIO()
     img.save(bio, format="PNG")
     bio.seek(0)
     return bio
 
-# ---------------- Клавиатуры ----------------
+# ------------------ Клавиатуры ------------------
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton("☕ Мои штампы", callback_data="show_stamps")],
@@ -107,11 +107,12 @@ def admin_kb(user_id:int):
         [InlineKeyboardButton("⬅️ Список клиентов", callback_data="admin_all")]
     ])
 
-# ---------------- Админ состояния ----------------
-admins_waiting_password = {}  # chat_id -> True
-admins_active = {}  # chat_id -> user_id клиента для редактирования
+# ------------------ Админ состояния ------------------
+admins_authenticated = {}  # chat_id -> True/False
+admins_active = {}  # chat_id -> user_id текущего клиента
+admins_waiting_password = {}  # chat_id -> True/False
 
-# ---------------- Пагинация ----------------
+# ------------------ Пагинация ------------------
 CLIENTS_PER_PAGE = 5
 
 def get_clients_page(page:int=0):
@@ -136,11 +137,27 @@ def get_clients_page(page:int=0):
 
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# ---------------- Хендлеры ----------------
+# ------------------ Хендлеры ------------------
 @dp.message(Command("start"))
 async def start_cmd(msg: types.Message):
     uid = msg.from_user.id
     create_or_update_user(uid, msg.from_user.first_name, msg.from_user.username)
+
+    args = msg.get_args()
+    # QR переход для админа
+    if args.startswith("admin_"):
+        client_id = int(args.split("_")[1])
+        if admins_authenticated.get(uid):
+            admins_active[uid] = client_id
+            user = get_user(client_id)
+            await msg.answer(f"Админ-панель @{user[1]} | Штампы: {user[3]}/10 | Копилка: {user[4]}",
+                             reply_markup=admin_kb(client_id))
+            return
+        else:
+            admins_waiting_password[uid] = client_id
+            await msg.answer("Введите пароль для входа в админ-панель клиента:")
+            return
+
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("▶️ Начать", callback_data="start")]])
     await msg.answer("Добро пожаловать в MollyCoffee Loyalty Bot!\nНажмите кнопку 'Начать', чтобы открыть меню.", reply_markup=kb)
 
@@ -149,7 +166,7 @@ async def start_button(c: types.CallbackQuery):
     await c.message.edit_text("Меню:", reply_markup=main_kb())
     await c.answer()
 
-# ---------------- Админ вход ----------------
+# ------------------ Админ вход ------------------
 @dp.message(Command("admin"))
 async def admin_cmd(msg: types.Message):
     admins_waiting_password[msg.from_user.id] = True
@@ -158,30 +175,40 @@ async def admin_cmd(msg: types.Message):
 @dp.message()
 async def check_password(msg: types.Message):
     chat_id = msg.from_user.id
-    if admins_waiting_password.get(chat_id):
-        if msg.text.strip() == ADMIN_PASSWORD:
-            admins_waiting_password.pop(chat_id)
-            await msg.answer("Пароль верный! Отсканируйте QR клиента или введите его user_id, чтобы открыть панель:", reply_markup=None)
-        else:
-            await msg.answer("❌ Неверный пароль")
-            admins_waiting_password.pop(chat_id)
-        return
+    text = msg.text.strip()
 
-    # Если админ выбрал клиента вручную
-    if admins_active.get(chat_id):
-        try:
-            client_id = int(msg.text.strip())
-            if get_user(client_id):
+    # Пароль для QR-клиента
+    if chat_id in admins_waiting_password:
+        client_id = admins_waiting_password.pop(chat_id)
+        if text == ADMIN_PASSWORD:
+            admins_authenticated[chat_id] = True
+            if isinstance(client_id, int):
                 admins_active[chat_id] = client_id
                 user = get_user(client_id)
-                await msg.answer(f"@{user[1]} | Штампы: {user[3]}/10 | Копилка: {user[4]}",
+                await msg.answer(f"Админ-панель @{user[1]} | Штампы: {user[3]}/10 | Копилка: {user[4]}",
                                  reply_markup=admin_kb(client_id))
             else:
-                await msg.answer("Клиент не найден.")
-        except:
-            await msg.answer("Введите корректный user_id клиента.")
+                # Пароль от /admin → показать список клиентов
+                await msg.answer("Список клиентов:", reply_markup=get_clients_page(0))
+        else:
+            await msg.answer("❌ Неверный пароль")
+        return
 
-# ---------------- Кнопки клиента ----------------
+    # Если админ авторизован и ввёл user_id вручную
+    if admins_authenticated.get(chat_id):
+        try:
+            client_id = int(text)
+            user = get_user(client_id)
+            if user:
+                admins_active[chat_id] = client_id
+                await msg.answer(f"Админ-панель @{user[1]} | Штампы: {user[3]}/10 | Копилка: {user[4]}",
+                                 reply_markup=admin_kb(client_id))
+            else:
+                await msg.answer("Клиент не найден")
+        except:
+            pass
+
+# ------------------ Кнопки клиента ------------------
 @dp.callback_query(Text("show_stamps"))
 async def show_stamps_cb(c: types.CallbackQuery):
     user = get_user(c.from_user.id)
@@ -193,55 +220,56 @@ async def show_stamps_cb(c: types.CallbackQuery):
 @dp.callback_query(Text("send_qr"))
 async def send_qr_cb(c: types.CallbackQuery):
     bio = generate_qr(c.from_user.id)
-    await c.message.answer_photo(photo=bio, caption="Покажите этот QR бариста для начисления штампов.")
+    file = BufferedInputFile(bio, filename="qr.png")
+    await c.message.answer_photo(photo=file, caption="Покажите этот QR бариста для начисления штампов.")
     await c.answer()
 
-# ---------------- Админ кнопки ----------------
-@dp.callback_query(lambda c: c.data.startswith("admin_") or c.data in ["admin_all", "admin_select"])
+# ------------------ Админ кнопки ------------------
+@dp.callback_query(lambda c: c.data.startswith("admin_") or c.data in ["admin_all"])
 async def admin_actions(c: types.CallbackQuery):
     chat_id = c.from_user.id
     data = c.data
 
+    # Начислить штамп
     if data.startswith("admin_add:"):
-        user_id = int(data.split(":")[1])
-        add_stamp(user_id)
-        admins_active[chat_id] = user_id
-        await c.answer("Штамп начислен.")
+        client_id = int(data.split(":")[1])
+        add_stamp(client_id)
+        admins_active[chat_id] = client_id
+        await c.answer("Штамп начислен ✅")
 
+    # Выдать кофе
     elif data.startswith("admin_coffee:"):
-        user_id = int(data.split(":")[1])
-        use_free_coffee(user_id)
-        admins_active[chat_id] = user_id
-        await c.answer("Бесплатный кофе выдан и штампы сброшены")
+        client_id = int(data.split(":")[1])
+        use_free_coffee(client_id)
+        admins_active[chat_id] = client_id
+        await c.answer("Бесплатный кофе выдан 🎉")
 
+    # В копилку
     elif data.startswith("admin_bank:"):
-        user_id = int(data.split(":")[1])
-        use_free_coffee(user_id, reset_stamps=False)
-        admins_active[chat_id] = user_id
-        await c.answer("Бесплатный кофе положен в копилку")
+        client_id = int(data.split(":")[1])
+        use_free_coffee(client_id, reset_stamps=False)
+        admins_active[chat_id] = client_id
+        await c.answer("Бесплатный кофе положен в копилку ☑️")
 
+    # История клиента
     elif data.startswith("admin_history:"):
-        user_id = int(data.split(":")[1])
-        cursor.execute("SELECT action, timestamp FROM history WHERE user_id=? ORDER BY id DESC LIMIT 20", (user_id,))
+        client_id = int(data.split(":")[1])
+        cursor.execute("SELECT action, timestamp FROM history WHERE user_id=? ORDER BY id DESC LIMIT 20", (client_id,))
         rows = cursor.fetchall()
-        text = f"История @{get_user(user_id)[1]}:\n"
+        text = f"История @{get_user(client_id)[1]}:\n"
         for act, ts in rows:
             text += f"{ts[:19]} - {act}\n"
         await c.message.answer(text)
         await c.answer()
+        return
 
+    # Список всех клиентов
     elif data == "admin_all":
         await c.message.edit_text("Список клиентов (нажмите на клиента для выбора):", reply_markup=get_clients_page(0))
         await c.answer()
         return
 
-    elif data == "admin_select":
-        admins_active.pop(chat_id, None)
-        await c.message.answer("Введите user_id клиента для открытия панели или отсканируйте его QR:")
-        await c.answer()
-        return
-
-    # ---------------- Пагинация и выбор клиента ----------------
+    # Навигация по страницам и выбор клиента
     elif data.startswith("admin_clients_page:") or data.startswith("admin_select_client:"):
         if data.startswith("admin_clients_page:"):
             page = int(data.split(":")[1])
@@ -255,13 +283,13 @@ async def admin_actions(c: types.CallbackQuery):
         await c.answer()
         return
 
-    # Обновляем панель текущего клиента
+    # Обновление панели текущего клиента
     user_id = admins_active.get(chat_id)
     if user_id:
         user = get_user(user_id)
         await c.message.edit_text(f"@{user[1]} | Штампы: {user[3]}/10 | Копилка: {user[4]}", reply_markup=admin_kb(user_id))
 
-# ---------------- Запуск ----------------
+# ------------------ Запуск ------------------
 async def main():
     print("Bot started")
     await dp.start_polling()
